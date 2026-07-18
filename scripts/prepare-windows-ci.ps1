@@ -79,7 +79,7 @@ if (-not (Test-Path $FfmpegExe) -or -not (Test-Path $FfprobeExe)) {
 
 $ModelPath = Join-Path $ModelDir $ModelName
 if (-not (Test-Path $ModelPath)) {
-    $ModelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/$ModelRevision/$ModelName?download=true"
+    $ModelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/$ModelRevision/${ModelName}?download=true"
     Download-File $ModelUrl $ModelPath
 }
 if ((Get-Item $ModelPath).Length -ne $ModelSize) {
