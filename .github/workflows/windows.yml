@@ -1,0 +1,130 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  WHISPER_VERSION: "v1.9.1"
+  WHISPER_ASSET: "whisper-cublas-12.4.0-bin-x64.zip"
+  MODEL_REVISION: "98aa99a0a9db05ae2342309f5096248665f7cba3"
+  MODEL_NAME: "ggml-large-v3-turbo-q5_0.bin"
+  FFMPEG_CACHE_REVISION: "2026-07-18"
+
+jobs:
+  build:
+    name: Windows x64 NSIS
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Set up stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: windows-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Cache native AI runtime
+        uses: actions/cache@v5
+        with:
+          path: |
+            src-tauri/resources/sidecars
+            src-tauri/resources/models
+          key: windows-ai-${{ env.WHISPER_VERSION }}-cuda124-${{ env.MODEL_REVISION }}-ffmpeg-${{ env.FFMPEG_CACHE_REVISION }}
+
+      - name: Prepare CUDA Whisper, FFmpeg, and model
+        shell: pwsh
+        run: |
+          ./scripts/prepare-windows-ci.ps1 `
+            -WhisperVersion $env:WHISPER_VERSION `
+            -WhisperAsset $env:WHISPER_ASSET `
+            -ModelRevision $env:MODEL_REVISION `
+            -ModelName $env:MODEL_NAME
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend checks
+        run: npm run build
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: Build NSIS setup executable
+        run: npm run tauri build
+
+      - name: Locate installer
+        id: installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "Tauri did not produce an NSIS setup executable." }
+          "path=$($installer.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "name=$($installer.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Built $($installer.FullName) ($([math]::Round($installer.Length / 1MB)) MB)"
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: leonardo-windows-x64
+          path: ${{ steps.installer.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: leonardo-windows-x64
+          path: release
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = Get-ChildItem "release/*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "The Windows installer artifact is missing." }
+          gh release create $env:GITHUB_REF_NAME $installer.FullName `
+            --verify-tag `
+            --generate-notes `
+            --title "Leonardo $env:GITHUB_REF_NAME"

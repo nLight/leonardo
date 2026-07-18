@@ -67,6 +67,19 @@ The script builds whisper.cpp with Vulkan acceleration, gathers its runtime file
 
 Before distributing binaries publicly, review and ship the corresponding notices/source obligations for the exact FFmpeg build selected by the script.
 
+### GitHub Actions
+
+The `Build Windows installer` workflow builds and tests Leonardo on `windows-latest` for pull requests, pushes to `main`, tags, and manual runs. It downloads a pinned official whisper.cpp CUDA 12.4 package, verifies the transcription model by SHA-256, caches the large native resources, and uploads `Leonardo_*_x64-setup.exe` as a 14-day workflow artifact.
+
+To build an installer without creating a release, open **Actions → Build Windows installer → Run workflow**. To publish the installer as a GitHub Release asset, push a version tag:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The tag job waits for the same tested Windows build and then creates the release automatically using the repository's built-in `GITHUB_TOKEN`; no repository secrets are required.
+
 ## DaVinci Resolve handoff
 
 Select **Resolve markers** for a transcribed recording. Leonardo writes an `.fcpxml` file into a `Leonardo Exports` folder next to the source recording. In Resolve, use **File → Import → Timeline** and choose the FCPXML file. The original recording is placed on a timeline and the generated key moments arrive as markers. SRT export is available beside it.
