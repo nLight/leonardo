@@ -17,6 +17,9 @@ const icons: Record<string, string> = {
   export: '<svg viewBox="0 0 24 24"><path d="M12 3v12M7 8l5-5 5 5"/><path d="M5 14v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/></svg>',
   chevron: '<svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>',
   close: '<svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24"><path d="M20 6v5h-5"/><path d="M4 18v-5h5"/><path d="M18.2 9A7 7 0 0 0 6.4 6.4L4 9M5.8 15A7 7 0 0 0 17.6 17.6L20 15"/></svg>',
+  check: '<svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg>',
+  sort: '<svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h8M8 18h4M4 5v14"/></svg>',
 };
 
 let snapshot: LibrarySnapshot = {
@@ -39,6 +42,14 @@ let statusFilter: "all" | RecordingStatus = "all";
 let demoMode = false;
 let settingsOpen = false;
 let busy = false;
+let rescanning = false;
+let lastSelectedId = "";
+let sortBy: "newest" | "oldest" | "name" | "duration" = "newest";
+let previewObserver: IntersectionObserver | null = null;
+let previewLoading = 0;
+const previewCache = new Map<string, string>();
+const previewRequested = new Set<string>();
+const previewQueue: Recording[] = [];
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -71,7 +82,7 @@ function relativeDate(timestamp: number): string {
 
 function filteredRecordings(): Recording[] {
   const needle = query.trim().toLowerCase();
-  return snapshot.recordings.filter((recording) => {
+  const recordings = snapshot.recordings.filter((recording) => {
     if (statusFilter !== "all" && recording.status !== statusFilter) return false;
     if (!needle) return true;
     const haystack = [
@@ -82,6 +93,16 @@ function filteredRecordings(): Recording[] {
     ].join(" ").toLowerCase();
     return haystack.includes(needle);
   });
+  return recordings.sort((left, right) => {
+    if (sortBy === "oldest") return left.modifiedAt - right.modifiedAt;
+    if (sortBy === "name") return left.displayTitle.localeCompare(right.displayTitle, undefined, { numeric: true });
+    if (sortBy === "duration") return (right.durationMs ?? -1) - (left.durationMs ?? -1);
+    return right.modifiedAt - left.modifiedAt;
+  });
+}
+
+function previewKey(recording: Recording): string {
+  return `${recording.id}:${recording.modifiedAt}`;
 }
 
 function statusLabel(recording: Recording): string {
@@ -95,6 +116,9 @@ function render(): void {
   if (current && selectedId !== current.id) selectedId = current.id;
   const ready = snapshot.recordings.filter((item) => item.status === "ready").length;
   const pending = snapshot.recordings.filter((item) => item.status === "new" || item.status === "error").length;
+  const errors = snapshot.recordings.filter((item) => item.status === "error").length;
+  const selectedVisible = recordings.filter((item) => selected.has(item.id)).length;
+  const allVisibleSelected = recordings.length > 0 && selectedVisible === recordings.length;
 
   app.innerHTML = `
     <div class="shell">
@@ -116,7 +140,8 @@ function render(): void {
       </aside>
       <main class="main">
         <header class="topbar">
-          <div class="search-box">${icons.search}<input id="search" placeholder="Search anything you said…" value="${escapeHtml(query)}"><kbd>Ctrl K</kbd></div>
+          <div class="search-box">${icons.search}<input id="search" placeholder="Search anything you said…" value="${escapeHtml(query)}">${query ? `<button class="search-clear" data-action="clear-search" title="Clear search">${icons.close}</button>` : ""}<kbd>Ctrl K</kbd></div>
+          <button class="button secondary rescan-button ${rescanning ? "loading" : ""}" data-action="rescan" ${busy || rescanning || !snapshot.settings.mediaFolders.length ? "disabled" : ""} title="Look for added, changed, or removed recordings">${icons.refresh} ${rescanning ? "Scanning…" : "Rescan"}</button>
           <button class="button secondary" data-action="add-folder">${icons.plus} Add folder</button>
           <button class="button primary" data-action="transcribe-selected" ${busy || (!selected.size && pending === 0) ? "disabled" : ""}>${icons.spark} ${selected.size ? `Transcribe ${selected.size}` : "Transcribe new"}</button>
         </header>
@@ -128,12 +153,19 @@ function render(): void {
                 <button class="${statusFilter === "all" ? "active" : ""}" data-filter="all">All</button>
                 <button class="${statusFilter === "ready" ? "active" : ""}" data-filter="ready">Ready</button>
                 <button class="${statusFilter === "new" ? "active" : ""}" data-filter="new">New</button>
+                ${errors ? `<button class="${statusFilter === "error" ? "active danger" : ""}" data-filter="error">Errors <span>${errors}</span></button>` : ""}
               </div>
             </div>
             ${snapshot.recordings.length === 0 ? renderEmpty() : `
-              <div class="table-head"><span></span><span>Recording</span><span>Length</span><span>Added</span><span>Status</span></div>
+              <div class="library-controls ${selected.size ? "has-selection" : ""}">
+                <div class="selection-summary">
+                  ${selected.size ? `<span class="selection-count">${icons.check}<strong>${selected.size}</strong> selected</span><button class="text-button" data-action="select-visible">${allVisibleSelected ? "Deselect visible" : `Select all ${recordings.length} shown`}</button><button class="text-button muted-action" data-action="clear-selection">Clear</button>` : `<span class="selection-hint">Select recordings to transcribe them as a batch</span><button class="text-button" data-action="select-visible">Select all ${recordings.length} shown</button>`}
+                </div>
+                <label class="sort-control">${icons.sort}<select id="sort-recordings" aria-label="Sort recordings"><option value="newest" ${sortBy === "newest" ? "selected" : ""}>Newest first</option><option value="oldest" ${sortBy === "oldest" ? "selected" : ""}>Oldest first</option><option value="name" ${sortBy === "name" ? "selected" : ""}>Name</option><option value="duration" ${sortBy === "duration" ? "selected" : ""}>Longest first</option></select></label>
+              </div>
+              <div class="table-head"><label class="check select-all" title="Select all visible recordings"><input type="checkbox" data-select-all ${allVisibleSelected ? "checked" : ""}><span></span></label><span>Recording</span><span>Length</span><span>Added</span><span>Status</span></div>
               <div class="recording-list">
-                ${recordings.map((recording) => renderRow(recording, recording.id === current?.id)).join("") || '<div class="no-results">No recordings match your search.</div>'}
+                ${recordings.map((recording) => renderRow(recording, recording.id === current?.id)).join("") || `<div class="no-results"><div>${icons.search}</div><strong>No recordings found</strong><span>Try a different search or clear the active filter.</span><button class="button secondary" data-action="clear-filters">Clear filters</button></div>`}
               </div>
             `}
           </div>
@@ -144,6 +176,7 @@ function render(): void {
       <div id="toast-root"></div>
     </div>`;
   bindEvents();
+  observePreviews();
 }
 
 function renderEmpty(): string {
@@ -156,11 +189,20 @@ function renderEmpty(): string {
   </div>`;
 }
 
+function renderPreview(recording: Recording, large = false): string {
+  const key = previewKey(recording);
+  const cached = previewCache.get(key);
+  return `<div class="${large ? "detail-preview" : "thumb"} ${cached ? "loaded" : "is-placeholder"}" data-preview-key="${escapeHtml(key)}" data-preview-id="${escapeHtml(recording.id)}" data-demo-id="${demoMode ? escapeHtml(recording.id) : ""}">
+    ${cached ? `<img src="${cached}" alt="Preview frame from ${escapeHtml(recording.displayTitle)}">` : `<span class="thumb-format">${recording.extension.toUpperCase()}</span><span class="preview-shimmer"></span>`}
+    <button data-action="open" data-id="${escapeHtml(recording.id)}" title="Play recording">${icons.play}<span>${large ? "Play original" : ""}</span></button>
+  </div>`;
+}
+
 function renderRow(recording: Recording, active: boolean): string {
   const checked = selected.has(recording.id);
   return `<article class="recording-row ${active ? "active" : ""}" data-id="${recording.id}">
     <label class="check" title="Select"><input type="checkbox" data-select="${recording.id}" ${checked ? "checked" : ""}><span></span></label>
-    <div class="recording-main"><div class="thumb"><span>${recording.extension.toUpperCase()}</span>${recording.status === "ready" ? `<button data-action="open" data-id="${recording.id}" title="Open recording">${icons.play}</button>` : ""}</div><div class="recording-copy"><strong>${escapeHtml(recording.displayTitle)}</strong><small>${escapeHtml(recording.fileName)} · ${formatSize(recording.sizeBytes)}</small></div></div>
+    <div class="recording-main">${renderPreview(recording)}<div class="recording-copy"><strong>${escapeHtml(recording.displayTitle)}</strong><small>${escapeHtml(recording.fileName)} · ${formatSize(recording.sizeBytes)}</small></div></div>
     <span class="cell muted">${formatTime(recording.durationMs)}</span>
     <span class="cell muted">${relativeDate(recording.modifiedAt)}</span>
     <span class="status ${recording.status}"><i></i>${statusLabel(recording)}</span>
@@ -169,12 +211,13 @@ function renderRow(recording: Recording, active: boolean): string {
 
 function renderDetails(recording: Recording): string {
   if (recording.status !== "ready") {
-    return `<aside class="details empty-detail"><div class="details-top"><span>Recording details</span></div><div class="waiting-art">${icons.spark}</div><h2>${recording.status === "processing" ? "Listening to your recording" : "Ready to transcribe"}</h2><p>${recording.status === "error" ? escapeHtml(recording.error || "The last transcription failed.") : "Generate a timestamped transcript and an edit-friendly overview."}</p>${recording.status === "processing" ? `<div class="progress"><span style="width:${recording.progress}%"></span></div>` : `<button class="button primary" data-action="transcribe-one" data-id="${recording.id}" ${busy ? "disabled" : ""}>${icons.spark} Transcribe recording</button>`}</aside>`;
+    return `<aside class="details empty-detail"><div class="details-top"><span>Recording details</span><button class="icon-button" data-action="open" data-id="${recording.id}" title="Open original">${icons.external}</button></div><div class="empty-detail-body">${renderPreview(recording, true)}<div class="waiting-art">${icons.spark}</div><h2>${recording.status === "processing" ? "Listening to your recording" : "Ready to transcribe"}</h2><p>${recording.status === "error" ? escapeHtml(recording.error || "The last transcription failed.") : "Generate a timestamped transcript and an edit-friendly overview."}</p>${recording.status === "processing" ? `<div class="progress"><span style="width:${recording.progress}%"></span></div>` : `<button class="button primary" data-action="transcribe-one" data-id="${recording.id}" ${busy ? "disabled" : ""}>${icons.spark} Transcribe recording</button>`}</div></aside>`;
   }
   return `<aside class="details">
     <div class="details-top"><span>Recording details</span><button class="icon-button" data-action="open" data-id="${recording.id}" title="Open original">${icons.external}</button></div>
     <div class="detail-scroll">
-      <div class="title-block"><span class="eyebrow">AI TITLE</span><h2>${escapeHtml(recording.displayTitle)}</h2><p>${escapeHtml(recording.fileName)}${recording.audioSource ? ` · ${escapeHtml(recording.audioSource)}` : ""}</p></div>
+      ${renderPreview(recording, true)}
+      <div class="title-block"><span class="eyebrow">AI TITLE</span><h2>${escapeHtml(recording.displayTitle)}</h2><p>${escapeHtml(recording.fileName)}${recording.audioSource ? ` · ${escapeHtml(recording.audioSource)}` : ""}</p><div class="metadata-chips"><span>${formatTime(recording.durationMs)}</span><span>${formatSize(recording.sizeBytes)}</span>${recording.audioTracks.length ? `<span>${recording.audioTracks.length} audio track${recording.audioTracks.length === 1 ? "" : "s"}</span>` : ""}</div></div>
       <section class="summary-card"><div class="section-title">${icons.spark}<span>Quick take</span></div><p>${escapeHtml(recording.summary)}</p></section>
       <section class="chapters"><div class="section-header"><span>Key moments</span><em>${recording.chapters.length}</em></div>
         ${recording.chapters.map((chapter, index) => `<button class="chapter" data-action="seek" data-id="${recording.id}" data-ms="${chapter.startMs}"><span class="chapter-time">${formatTime(chapter.startMs)}</span><span class="chapter-line"></span><span class="chapter-index">${index + 1}</span><span class="chapter-copy"><strong>${escapeHtml(chapter.title)}</strong><small>${escapeHtml(chapter.description)}</small></span>${icons.chevron}</button>`).join("")}
@@ -232,11 +275,36 @@ function bindEvents(): void {
     selectedId = row.dataset.id || "";
     render();
   }));
-  document.querySelectorAll<HTMLInputElement>("[data-select]").forEach((checkbox) => checkbox.addEventListener("change", () => {
+  document.querySelectorAll<HTMLInputElement>("[data-select]").forEach((checkbox) => checkbox.addEventListener("click", (event) => {
     const id = checkbox.dataset.select!;
-    checkbox.checked ? selected.add(id) : selected.delete(id);
+    if ((event as MouseEvent).shiftKey && lastSelectedId) {
+      const ids = filteredRecordings().map((recording) => recording.id);
+      const from = ids.indexOf(lastSelectedId);
+      const to = ids.indexOf(id);
+      if (from >= 0 && to >= 0) {
+        ids.slice(Math.min(from, to), Math.max(from, to) + 1).forEach((rangeId) => checkbox.checked ? selected.add(rangeId) : selected.delete(rangeId));
+      }
+    } else {
+      checkbox.checked ? selected.add(id) : selected.delete(id);
+    }
+    lastSelectedId = id;
     render();
   }));
+  document.querySelector<HTMLInputElement>("[data-select-all]")?.addEventListener("change", (event) => {
+    const checked = (event.target as HTMLInputElement).checked;
+    filteredRecordings().forEach((recording) => checked ? selected.add(recording.id) : selected.delete(recording.id));
+    render();
+  });
+  const selectAll = document.querySelector<HTMLInputElement>("[data-select-all]");
+  if (selectAll) {
+    const visible = filteredRecordings();
+    const selectedVisible = visible.filter((recording) => selected.has(recording.id)).length;
+    selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+  }
+  document.querySelector<HTMLSelectElement>("#sort-recordings")?.addEventListener("change", (event) => {
+    sortBy = (event.target as HTMLSelectElement).value as typeof sortBy;
+    render();
+  });
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element)));
   document.querySelector<HTMLFormElement>("#settings-form")?.addEventListener("submit", saveSettings);
 }
@@ -248,6 +316,16 @@ async function handleAction(element: HTMLElement): Promise<void> {
   if (action === "show-ready") { statusFilter = "ready"; render(); }
   if (action === "settings") { settingsOpen = true; render(); }
   if (action === "close-settings") { settingsOpen = false; render(); }
+  if (action === "clear-search") { query = ""; render(); }
+  if (action === "clear-filters") { query = ""; statusFilter = "all"; render(); }
+  if (action === "clear-selection") { selected.clear(); lastSelectedId = ""; render(); }
+  if (action === "select-visible") {
+    const visible = filteredRecordings();
+    const allSelected = visible.length > 0 && visible.every((recording) => selected.has(recording.id));
+    visible.forEach((recording) => allSelected ? selected.delete(recording.id) : selected.add(recording.id));
+    render();
+  }
+  if (action === "rescan") await rescan();
   if (action === "transcribe-one" && element.dataset.id) await transcribe([element.dataset.id]);
   if (action === "transcribe-selected") {
     const ids = selected.size ? [...selected] : snapshot.recordings.filter((item) => item.status === "new" || item.status === "error").map((item) => item.id);
@@ -263,8 +341,103 @@ async function addFolder(): Promise<void> {
   if (demoMode) { snapshot = { recordings: [], settings: snapshot.settings }; demoMode = false; }
   try {
     const next = await backend<LibrarySnapshot>("choose_and_scan_folder");
-    if (next) { snapshot = next; selectedId = snapshot.recordings[0]?.id || ""; render(); }
+    if (next) {
+      snapshot = next;
+      selected.clear();
+      selectedId = snapshot.recordings[0]?.id || "";
+      render();
+    }
   } catch (error) { toast(String(error), true); }
+}
+
+async function rescan(): Promise<void> {
+  if (rescanning || busy) return;
+  if (demoMode) { toast("Add your own capture folder before rescanning."); return; }
+  if (!snapshot.settings.mediaFolders.length) { await addFolder(); return; }
+  const before = new Set(snapshot.recordings.map((recording) => recording.id));
+  rescanning = true;
+  render();
+  try {
+    const next = await backend<LibrarySnapshot>("rescan_media_folders");
+    const after = new Set(next.recordings.map((recording) => recording.id));
+    const added = next.recordings.filter((recording) => !before.has(recording.id)).length;
+    const removed = snapshot.recordings.filter((recording) => !after.has(recording.id)).length;
+    snapshot = next;
+    selected = new Set([...selected].filter((id) => after.has(id)));
+    if (!after.has(selectedId)) selectedId = snapshot.recordings[0]?.id || "";
+    toast(added || removed ? `Library updated · ${added} added · ${removed} removed` : "Library is already up to date");
+  } catch (error) {
+    toast(String(error), true);
+  } finally {
+    rescanning = false;
+    render();
+  }
+}
+
+function observePreviews(): void {
+  previewObserver?.disconnect();
+  previewObserver = null;
+  if (demoMode || !isTauri()) return;
+  previewObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      const element = entry.target as HTMLElement;
+      const id = element.dataset.previewId;
+      const key = element.dataset.previewKey;
+      if (!id || !key) return;
+      const recording = snapshot.recordings.find((item) => item.id === id && previewKey(item) === key);
+      if (recording) queuePreview(recording);
+      previewObserver?.unobserve(element);
+    });
+  }, { rootMargin: "180px" });
+  document.querySelectorAll<HTMLElement>("[data-preview-key]").forEach((element) => {
+    const key = element.dataset.previewKey!;
+    const cached = previewCache.get(key);
+    if (cached) applyPreview(key, cached);
+    else previewObserver?.observe(element);
+  });
+}
+
+function queuePreview(recording: Recording): void {
+  const key = previewKey(recording);
+  if (previewCache.has(key) || previewRequested.has(key)) return;
+  previewRequested.add(key);
+  previewQueue.push(recording);
+  pumpPreviewQueue();
+}
+
+function pumpPreviewQueue(): void {
+  while (previewLoading < 3 && previewQueue.length) {
+    const recording = previewQueue.shift()!;
+    const key = previewKey(recording);
+    previewLoading += 1;
+    backend<string>("recording_thumbnail", { id: recording.id })
+      .then((url) => {
+        previewCache.set(key, url);
+        applyPreview(key, url);
+      })
+      .catch(() => {
+        document.querySelectorAll<HTMLElement>(`[data-preview-key="${CSS.escape(key)}"]`).forEach((element) => element.classList.add("preview-failed"));
+      })
+      .finally(() => {
+        previewLoading -= 1;
+        pumpPreviewQueue();
+      });
+  }
+}
+
+function applyPreview(key: string, url: string): void {
+  document.querySelectorAll<HTMLElement>(`[data-preview-key="${CSS.escape(key)}"]`).forEach((element) => {
+    if (element.querySelector("img")) return;
+    const image = document.createElement("img");
+    image.src = url;
+    image.alt = "Video preview";
+    element.querySelector(".thumb-format")?.remove();
+    element.querySelector(".preview-shimmer")?.remove();
+    element.insertBefore(image, element.querySelector("button"));
+    element.classList.remove("is-placeholder", "preview-failed");
+    element.classList.add("loaded");
+  });
 }
 
 async function transcribe(ids: string[]): Promise<void> {
@@ -333,11 +506,23 @@ function toast(message: string, isError = false): void {
 }
 
 document.addEventListener("keydown", (event) => {
+  const target = event.target as HTMLElement;
+  const isTyping = target.matches("input, textarea, select") || target.isContentEditable;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     document.querySelector<HTMLInputElement>("#search")?.focus();
   }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && !isTyping && !settingsOpen) {
+    event.preventDefault();
+    filteredRecordings().forEach((recording) => selected.add(recording.id));
+    render();
+  }
+  if (event.key === "F5" && !settingsOpen) {
+    event.preventDefault();
+    void rescan();
+  }
   if (event.key === "Escape" && settingsOpen) { settingsOpen = false; render(); }
+  else if (event.key === "Escape" && selected.size) { selected.clear(); lastSelectedId = ""; render(); }
 });
 
 async function start(): Promise<void> {

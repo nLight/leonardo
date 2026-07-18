@@ -11,6 +11,9 @@ No Python runtime, virtual environment, cloud upload, or account is used. The pa
 - Extracts mono 16 kHz audio with FFmpeg and transcribes it with `whisper-cli`.
 - Understands multi-track MKV audio with automatic microphone detection, a fixed microphone-track setting, or an all-track mix.
 - Searches generated titles, summaries, filenames, and every transcript segment.
+- Lazily generates and caches real video-frame previews with the bundled FFmpeg.
+- Rescans configured capture folders without losing existing transcripts or metadata.
+- Supports select-all, shift-range selection, batch transcription, sorting, and keyboard shortcuts (`Ctrl+A`, `Ctrl+K`, `F5`, and `Esc`).
 - Creates timestamped chapters and an extractive session overview.
 - Preserves original filenames and video files; generated names remain metadata.
 - Exports SRT subtitles.

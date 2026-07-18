@@ -1875,6 +1875,7 @@ dependencies = [
 name = "leonardo"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "rfd",
  "serde",
  "serde_json",

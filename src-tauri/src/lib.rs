@@ -1,3 +1,4 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
@@ -176,7 +177,18 @@ fn choose_and_scan_folder(
     {
         library.settings.media_folders.push(folder_string);
     }
-    rescan_library(&mut library)?;
+    scan_library(&mut library)?;
+    save_library(&app, &library)?;
+    Ok(library.clone())
+}
+
+#[tauri::command]
+fn rescan_media_folders(
+    app: AppHandle,
+    state: State<'_, LibraryState>,
+) -> Result<LibrarySnapshot, String> {
+    let mut library = state.0.lock().map_err(lock_error)?;
+    scan_library(&mut library)?;
     save_library(&app, &library)?;
     Ok(library.clone())
 }
@@ -239,6 +251,30 @@ async fn transcribe_recording(
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+async fn recording_thumbnail(
+    app: AppHandle,
+    state: State<'_, LibraryState>,
+    id: String,
+) -> Result<String, String> {
+    let (recording, settings) = {
+        let library = state.0.lock().map_err(lock_error)?;
+        let recording = library
+            .recordings
+            .iter()
+            .find(|item| item.id == id)
+            .cloned()
+            .ok_or_else(|| "Recording not found".to_string())?;
+        (recording, library.settings.clone())
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        create_recording_thumbnail(&app, &settings, &recording)
+    })
+    .await
+    .map_err(|error| format!("Thumbnail worker stopped: {error}"))?
 }
 
 #[tauri::command]
@@ -427,7 +463,7 @@ fn process_recording(
     Ok(recording)
 }
 
-fn rescan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
+fn scan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
     let existing = library
         .recordings
         .drain(..)
@@ -503,6 +539,60 @@ fn rescan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
     recordings.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
     library.recordings = recordings;
     Ok(())
+}
+
+fn create_recording_thumbnail(
+    app: &AppHandle,
+    settings: &AppSettings,
+    recording: &Recording,
+) -> Result<String, String> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("Could not locate thumbnail cache: {error}"))?
+        .join("thumbnails");
+    fs::create_dir_all(&cache_dir)
+        .map_err(|error| format!("Could not create thumbnail cache: {error}"))?;
+    let thumbnail_path = cache_dir.join(format!("{}-{}.jpg", recording.id, recording.modified_at));
+
+    if !thumbnail_path.exists() {
+        let ffmpeg = resolve_tool(app, &settings.ffmpeg_path, "ffmpeg");
+        let seek_seconds = recording
+            .duration_ms
+            .map(|duration| (duration as f64 / 1_000.0 * 0.12).clamp(1.0, 30.0))
+            .unwrap_or(3.0);
+        let output = Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-ss"])
+            .arg(format!("{seek_seconds:.3}"))
+            .arg("-i")
+            .arg(&recording.path)
+            .args([
+                "-frames:v",
+                "1",
+                "-an",
+                "-sn",
+                "-vf",
+                "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+                "-q:v",
+                "6",
+            ])
+            .arg(&thumbnail_path)
+            .output()
+            .map_err(|error| tool_start_error("FFmpeg", &ffmpeg, error))?;
+        if !output.status.success() || !thumbnail_path.exists() {
+            return Err(format!(
+                "FFmpeg could not create a preview. {}",
+                stderr_text(&output.stderr)
+            ));
+        }
+    }
+
+    let bytes = fs::read(&thumbnail_path)
+        .map_err(|error| format!("Could not read generated preview: {error}"))?;
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 fn parse_srt(contents: &str) -> Result<Vec<TranscriptSegment>, String> {
@@ -1035,8 +1125,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_library,
             choose_and_scan_folder,
+            rescan_media_folders,
             save_settings,
             transcribe_recording,
+            recording_thumbnail,
             open_recording,
             export_srt,
             export_resolve_markers
