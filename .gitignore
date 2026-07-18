@@ -1,0 +1,14 @@
+node_modules
+dist
+target
+src-tauri/target
+src-tauri/gen
+.DS_Store
+*.log
+.build-windows
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+src-tauri/resources/sidecars/*
+!src-tauri/resources/sidecars/.gitkeep
+src-tauri/resources/models/*
+!src-tauri/resources/models/.gitkeep
