@@ -1,19 +1,26 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
+use std::os::windows::{fs::MetadataExt, process::CommandExt};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State};
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 const MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "mov", "avi", "webm", "m4v", "mpg", "mpeg", "mts", "m2ts",
 ];
+// Recycle-bin index records can inherit the original video extension but are only
+// a few hundred bytes. Real recordings comfortably exceed this conservative floor.
+const MIN_MEDIA_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -176,7 +183,18 @@ fn choose_and_scan_folder(
     {
         library.settings.media_folders.push(folder_string);
     }
-    rescan_library(&mut library)?;
+    scan_library(&mut library)?;
+    save_library(&app, &library)?;
+    Ok(library.clone())
+}
+
+#[tauri::command]
+fn rescan_media_folders(
+    app: AppHandle,
+    state: State<'_, LibraryState>,
+) -> Result<LibrarySnapshot, String> {
+    let mut library = state.0.lock().map_err(lock_error)?;
+    scan_library(&mut library)?;
     save_library(&app, &library)?;
     Ok(library.clone())
 }
@@ -239,6 +257,30 @@ async fn transcribe_recording(
             Err(error)
         }
     }
+}
+
+#[tauri::command]
+async fn recording_thumbnail(
+    app: AppHandle,
+    state: State<'_, LibraryState>,
+    id: String,
+) -> Result<String, String> {
+    let (recording, settings) = {
+        let library = state.0.lock().map_err(lock_error)?;
+        let recording = library
+            .recordings
+            .iter()
+            .find(|item| item.id == id)
+            .cloned()
+            .ok_or_else(|| "Recording not found".to_string())?;
+        (recording, library.settings.clone())
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        create_recording_thumbnail(&app, &settings, &recording)
+    })
+    .await
+    .map_err(|error| format!("Thumbnail worker stopped: {error}"))?
 }
 
 #[tauri::command]
@@ -363,7 +405,7 @@ fn process_recording(
     let output_base = work_dir.join("transcript");
 
     let audio_tracks = probe_audio_tracks(app, &settings, &recording.path)?;
-    let mut ffmpeg_command = Command::new(&ffmpeg);
+    let mut ffmpeg_command = hidden_command(&ffmpeg);
     ffmpeg_command
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&recording.path);
@@ -380,7 +422,7 @@ fn process_recording(
         ));
     }
 
-    let mut whisper_command = Command::new(&whisper);
+    let mut whisper_command = hidden_command(&whisper);
     whisper_command
         .arg("-m")
         .arg(&model)
@@ -427,7 +469,7 @@ fn process_recording(
     Ok(recording)
 }
 
-fn rescan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
+fn scan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
     let existing = library
         .recordings
         .drain(..)
@@ -439,6 +481,7 @@ fn rescan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
         for entry in WalkDir::new(folder)
             .follow_links(false)
             .into_iter()
+            .filter_entry(should_visit_entry)
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
         {
@@ -458,6 +501,9 @@ fn rescan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
             let metadata = entry
                 .metadata()
                 .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+            if !is_indexable_media(path, &metadata) {
+                continue;
+            }
             let modified_at = metadata
                 .modified()
                 .ok()
@@ -503,6 +549,165 @@ fn rescan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
     recordings.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
     library.recordings = recordings;
     Ok(())
+}
+
+fn should_visit_entry(entry: &DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    let name = entry.file_name().to_string_lossy();
+    if name.starts_with('.') || is_ignored_system_name(&name) {
+        return false;
+    }
+    entry
+        .metadata()
+        .map(|metadata| !has_hidden_or_system_attributes(&metadata))
+        .unwrap_or(true)
+}
+
+fn is_indexable_media(path: &Path, metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && metadata.len() >= MIN_MEDIA_FILE_BYTES
+        && !has_hidden_or_system_attributes(metadata)
+        && !is_ignored_path(path)
+}
+
+fn is_ignored_system_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "$recycle.bin" | "recycler" | "system volume information"
+    )
+}
+
+fn is_ignored_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name.starts_with('.') || is_ignored_system_name(&name)
+    })
+}
+
+fn has_hidden_or_system_attributes(metadata: &fs::Metadata) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+        return metadata.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn remove_invalid_index_entries(library: &mut LibrarySnapshot) -> bool {
+    let previous_len = library.recordings.len();
+    library.recordings.retain(|recording| {
+        recording.size_bytes >= MIN_MEDIA_FILE_BYTES && !is_ignored_path(Path::new(&recording.path))
+    });
+    library.recordings.len() != previous_len
+}
+
+fn create_recording_thumbnail(
+    app: &AppHandle,
+    settings: &AppSettings,
+    recording: &Recording,
+) -> Result<String, String> {
+    let thumbnail_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not locate persistent thumbnail storage: {error}"))?
+        .join("thumbnails");
+    fs::create_dir_all(&thumbnail_dir)
+        .map_err(|error| format!("Could not create persistent thumbnail storage: {error}"))?;
+    let file_name = format!("v1-{}-{}.jpg", recording.id, recording.modified_at);
+    let thumbnail_path = thumbnail_dir.join(&file_name);
+
+    if !thumbnail_is_valid(&thumbnail_path) {
+        let _ = fs::remove_file(&thumbnail_path);
+        if let Ok(legacy_dir) = app.path().app_cache_dir() {
+            let legacy_path = legacy_dir
+                .join("thumbnails")
+                .join(format!("{}-{}.jpg", recording.id, recording.modified_at));
+            if thumbnail_is_valid(&legacy_path) {
+                let _ = fs::copy(legacy_path, &thumbnail_path);
+            }
+        }
+    }
+
+    if !thumbnail_is_valid(&thumbnail_path) {
+        let ffmpeg = resolve_tool(app, &settings.ffmpeg_path, "ffmpeg");
+        let seek_seconds = recording
+            .duration_ms
+            .map(|duration| (duration as f64 / 1_000.0 * 0.12).clamp(1.0, 30.0))
+            .unwrap_or(3.0);
+        let temporary_path = thumbnail_dir.join(format!("{file_name}.pending.jpg"));
+        let _ = fs::remove_file(&temporary_path);
+        let mut command = hidden_command(&ffmpeg);
+        let output = command
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-ss"])
+            .arg(format!("{seek_seconds:.3}"))
+            .arg("-i")
+            .arg(&recording.path)
+            .args([
+                "-frames:v",
+                "1",
+                "-an",
+                "-sn",
+                "-vf",
+                "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+                "-q:v",
+                "6",
+            ])
+            .arg(&temporary_path)
+            .output()
+            .map_err(|error| tool_start_error("FFmpeg", &ffmpeg, error))?;
+        if !output.status.success() || !thumbnail_is_valid(&temporary_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(format!(
+                "FFmpeg could not create a preview. {}",
+                stderr_text(&output.stderr)
+            ));
+        }
+        fs::rename(&temporary_path, &thumbnail_path)
+            .map_err(|error| format!("Could not save generated preview: {error}"))?;
+
+        if let Ok(entries) = fs::read_dir(&thumbnail_dir) {
+            let obsolete_prefix = format!("v1-{}-", recording.id);
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                let is_obsolete = path != thumbnail_path
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(&obsolete_prefix));
+                if is_obsolete {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+    }
+
+    let bytes = fs::read(&thumbnail_path)
+        .map_err(|error| format!("Could not read generated preview: {error}"))?;
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn thumbnail_is_valid(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() < 512 {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; 3];
+    file.read_exact(&mut header).is_ok() && header == [0xff, 0xd8, 0xff]
 }
 
 fn parse_srt(contents: &str) -> Result<Vec<TranscriptSegment>, String> {
@@ -711,7 +916,7 @@ fn probe_audio_tracks(
     path: &str,
 ) -> Result<Vec<AudioTrackInfo>, String> {
     let ffprobe = resolve_tool(app, &settings.ffprobe_path, "ffprobe");
-    let output = Command::new(&ffprobe)
+    let output = hidden_command(&ffprobe)
         .args([
             "-v",
             "error",
@@ -836,7 +1041,7 @@ fn track_label(track: &AudioTrackInfo, reason: &str) -> String {
 
 fn probe_duration(app: &AppHandle, settings: &AppSettings, path: &str) -> Option<u64> {
     let ffprobe = resolve_tool(app, &settings.ffprobe_path, "ffprobe");
-    let output = Command::new(ffprobe)
+    let output = hidden_command(&ffprobe)
         .args([
             "-v",
             "error",
@@ -877,6 +1082,13 @@ fn resolve_tool(app: &AppHandle, configured: &str, name: &str) -> PathBuf {
         }
     }
     PathBuf::from(executable)
+}
+
+fn hidden_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x0800_0000);
+    command
 }
 
 fn resolve_model(app: &AppHandle, configured: &str) -> Result<PathBuf, String> {
@@ -1028,15 +1240,20 @@ fn lock_error<T>(error: std::sync::PoisonError<T>) -> String {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let library = read_library(app.handle());
+            let mut library = read_library(app.handle());
+            if remove_invalid_index_entries(&mut library) {
+                let _ = save_library(app.handle(), &library);
+            }
             app.manage(LibraryState(Mutex::new(library)));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             load_library,
             choose_and_scan_folder,
+            rescan_media_folders,
             save_settings,
             transcribe_recording,
+            recording_thumbnail,
             open_recording,
             export_srt,
             export_resolve_markers
@@ -1061,6 +1278,20 @@ mod tests {
     #[test]
     fn exports_srt_timestamps() {
         assert_eq!(srt_time(3_723_045), "01:02:03,045");
+    }
+
+    #[test]
+    fn ignores_hidden_and_windows_system_paths() {
+        assert!(is_ignored_path(Path::new(
+            "/captures/$RECYCLE.BIN/$IIMS3LD.mkv"
+        )));
+        assert!(is_ignored_path(Path::new(
+            "/captures/System Volume Information/index.mp4"
+        )));
+        assert!(is_ignored_path(Path::new("/captures/.trash/video.mkv")));
+        assert!(!is_ignored_path(Path::new(
+            "/captures/OBS/2026-07-19-session.mkv"
+        )));
     }
 
     #[test]

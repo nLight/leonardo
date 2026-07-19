@@ -6,6 +6,7 @@ src-tauri/gen
 .DS_Store
 *.log
 .build-windows
+.ci-cache
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
 src-tauri/resources/sidecars/*

@@ -11,6 +11,9 @@ No Python runtime, virtual environment, cloud upload, or account is used. The pa
 - Extracts mono 16 kHz audio with FFmpeg and transcribes it with `whisper-cli`.
 - Understands multi-track MKV audio with automatic microphone detection, a fixed microphone-track setting, or an all-track mix.
 - Searches generated titles, summaries, filenames, and every transcript segment.
+- Lazily generates and caches real video-frame previews with the bundled FFmpeg.
+- Rescans configured capture folders without losing existing transcripts or metadata.
+- Supports select-all, shift-range selection, batch transcription, sorting, and keyboard shortcuts (`Ctrl+A`, `Ctrl+K`, `F5`, and `Esc`).
 - Creates timestamped chapters and an extractive session overview.
 - Preserves original filenames and video files; generated names remain metadata.
 - Exports SRT subtitles.
@@ -66,6 +69,19 @@ Run this on a Windows build machine with Visual Studio C++ Build Tools, CMake, t
 The script builds whisper.cpp with Vulkan acceleration, gathers its runtime files, downloads FFmpeg and the 574 MB quantized large-v3-turbo model, and creates an NSIS installer. This is a release-engineering script; people installing Leonardo do not run it and do not need those developer tools.
 
 Before distributing binaries publicly, review and ship the corresponding notices/source obligations for the exact FFmpeg build selected by the script.
+
+### GitHub Actions
+
+The `Build Windows installer` workflow builds and tests Leonardo on `windows-latest` for pull requests, pushes to `main`, tags, and manual runs. It downloads a pinned official whisper.cpp CUDA 12.4 package, verifies the transcription model by SHA-256, caches the large native resources, and uploads `Leonardo_*_x64-setup.exe` as a 14-day workflow artifact.
+
+To build an installer without creating a release, open **Actions → Build Windows installer → Run workflow**. To publish the installer as a GitHub Release asset, push a version tag:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The tag job waits for the same tested Windows build and then creates the release automatically using the repository's built-in `GITHUB_TOKEN`; no repository secrets are required.
 
 ## DaVinci Resolve handoff
 
