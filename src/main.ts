@@ -111,6 +111,8 @@ function statusLabel(recording: Recording): string {
 }
 
 function render(): void {
+  const listScrollTop = document.querySelector<HTMLElement>(".recording-list")?.scrollTop;
+  const detailScrollTop = document.querySelector<HTMLElement>(".detail-scroll, .empty-detail-body")?.scrollTop;
   const recordings = filteredRecordings();
   const current = recordings.find((recording) => recording.id === selectedId) ?? recordings[0];
   if (current && selectedId !== current.id) selectedId = current.id;
@@ -177,6 +179,14 @@ function render(): void {
     </div>`;
   bindEvents();
   observePreviews();
+  restoreScrollPosition(".recording-list", listScrollTop);
+  restoreScrollPosition(".detail-scroll, .empty-detail-body", detailScrollTop);
+}
+
+function restoreScrollPosition(selector: string, scrollTop: number | undefined): void {
+  if (scrollTop === undefined) return;
+  const element = document.querySelector<HTMLElement>(selector);
+  if (element) element.scrollTop = scrollTop;
 }
 
 function renderEmpty(): string {

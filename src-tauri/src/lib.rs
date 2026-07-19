@@ -1,7 +1,7 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
+use std::os::windows::{fs::MetadataExt, process::CommandExt};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs,
@@ -13,11 +13,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State};
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 const MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "mov", "avi", "webm", "m4v", "mpg", "mpeg", "mts", "m2ts",
 ];
+// Recycle-bin index records can inherit the original video extension but are only
+// a few hundred bytes. Real recordings comfortably exceed this conservative floor.
+const MIN_MEDIA_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -478,6 +481,7 @@ fn scan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
         for entry in WalkDir::new(folder)
             .follow_links(false)
             .into_iter()
+            .filter_entry(should_visit_entry)
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
         {
@@ -497,6 +501,9 @@ fn scan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
             let metadata = entry
                 .metadata()
                 .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+            if !is_indexable_media(path, &metadata) {
+                continue;
+            }
             let modified_at = metadata
                 .modified()
                 .ok()
@@ -542,6 +549,63 @@ fn scan_library(library: &mut LibrarySnapshot) -> Result<(), String> {
     recordings.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
     library.recordings = recordings;
     Ok(())
+}
+
+fn should_visit_entry(entry: &DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    let name = entry.file_name().to_string_lossy();
+    if name.starts_with('.') || is_ignored_system_name(&name) {
+        return false;
+    }
+    entry
+        .metadata()
+        .map(|metadata| !has_hidden_or_system_attributes(&metadata))
+        .unwrap_or(true)
+}
+
+fn is_indexable_media(path: &Path, metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && metadata.len() >= MIN_MEDIA_FILE_BYTES
+        && !has_hidden_or_system_attributes(metadata)
+        && !is_ignored_path(path)
+}
+
+fn is_ignored_system_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "$recycle.bin" | "recycler" | "system volume information"
+    )
+}
+
+fn is_ignored_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name.starts_with('.') || is_ignored_system_name(&name)
+    })
+}
+
+fn has_hidden_or_system_attributes(metadata: &fs::Metadata) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+        return metadata.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn remove_invalid_index_entries(library: &mut LibrarySnapshot) -> bool {
+    let previous_len = library.recordings.len();
+    library.recordings.retain(|recording| {
+        recording.size_bytes >= MIN_MEDIA_FILE_BYTES && !is_ignored_path(Path::new(&recording.path))
+    });
+    library.recordings.len() != previous_len
 }
 
 fn create_recording_thumbnail(
@@ -1176,7 +1240,10 @@ fn lock_error<T>(error: std::sync::PoisonError<T>) -> String {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let library = read_library(app.handle());
+            let mut library = read_library(app.handle());
+            if remove_invalid_index_entries(&mut library) {
+                let _ = save_library(app.handle(), &library);
+            }
             app.manage(LibraryState(Mutex::new(library)));
             Ok(())
         })
@@ -1211,6 +1278,20 @@ mod tests {
     #[test]
     fn exports_srt_timestamps() {
         assert_eq!(srt_time(3_723_045), "01:02:03,045");
+    }
+
+    #[test]
+    fn ignores_hidden_and_windows_system_paths() {
+        assert!(is_ignored_path(Path::new(
+            "/captures/$RECYCLE.BIN/$IIMS3LD.mkv"
+        )));
+        assert!(is_ignored_path(Path::new(
+            "/captures/System Volume Information/index.mp4"
+        )));
+        assert!(is_ignored_path(Path::new("/captures/.trash/video.mkv")));
+        assert!(!is_ignored_path(Path::new(
+            "/captures/OBS/2026-07-19-session.mkv"
+        )));
     }
 
     #[test]
