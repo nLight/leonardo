@@ -1,9 +1,12 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -399,7 +402,7 @@ fn process_recording(
     let output_base = work_dir.join("transcript");
 
     let audio_tracks = probe_audio_tracks(app, &settings, &recording.path)?;
-    let mut ffmpeg_command = Command::new(&ffmpeg);
+    let mut ffmpeg_command = hidden_command(&ffmpeg);
     ffmpeg_command
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&recording.path);
@@ -416,7 +419,7 @@ fn process_recording(
         ));
     }
 
-    let mut whisper_command = Command::new(&whisper);
+    let mut whisper_command = hidden_command(&whisper);
     whisper_command
         .arg("-m")
         .arg(&model)
@@ -546,22 +549,38 @@ fn create_recording_thumbnail(
     settings: &AppSettings,
     recording: &Recording,
 ) -> Result<String, String> {
-    let cache_dir = app
+    let thumbnail_dir = app
         .path()
-        .app_cache_dir()
-        .map_err(|error| format!("Could not locate thumbnail cache: {error}"))?
+        .app_data_dir()
+        .map_err(|error| format!("Could not locate persistent thumbnail storage: {error}"))?
         .join("thumbnails");
-    fs::create_dir_all(&cache_dir)
-        .map_err(|error| format!("Could not create thumbnail cache: {error}"))?;
-    let thumbnail_path = cache_dir.join(format!("{}-{}.jpg", recording.id, recording.modified_at));
+    fs::create_dir_all(&thumbnail_dir)
+        .map_err(|error| format!("Could not create persistent thumbnail storage: {error}"))?;
+    let file_name = format!("v1-{}-{}.jpg", recording.id, recording.modified_at);
+    let thumbnail_path = thumbnail_dir.join(&file_name);
 
-    if !thumbnail_path.exists() {
+    if !thumbnail_is_valid(&thumbnail_path) {
+        let _ = fs::remove_file(&thumbnail_path);
+        if let Ok(legacy_dir) = app.path().app_cache_dir() {
+            let legacy_path = legacy_dir
+                .join("thumbnails")
+                .join(format!("{}-{}.jpg", recording.id, recording.modified_at));
+            if thumbnail_is_valid(&legacy_path) {
+                let _ = fs::copy(legacy_path, &thumbnail_path);
+            }
+        }
+    }
+
+    if !thumbnail_is_valid(&thumbnail_path) {
         let ffmpeg = resolve_tool(app, &settings.ffmpeg_path, "ffmpeg");
         let seek_seconds = recording
             .duration_ms
             .map(|duration| (duration as f64 / 1_000.0 * 0.12).clamp(1.0, 30.0))
             .unwrap_or(3.0);
-        let output = Command::new(&ffmpeg)
+        let temporary_path = thumbnail_dir.join(format!("{file_name}.pending.jpg"));
+        let _ = fs::remove_file(&temporary_path);
+        let mut command = hidden_command(&ffmpeg);
+        let output = command
             .args(["-hide_banner", "-loglevel", "error", "-y", "-ss"])
             .arg(format!("{seek_seconds:.3}"))
             .arg("-i")
@@ -576,14 +595,32 @@ fn create_recording_thumbnail(
                 "-q:v",
                 "6",
             ])
-            .arg(&thumbnail_path)
+            .arg(&temporary_path)
             .output()
             .map_err(|error| tool_start_error("FFmpeg", &ffmpeg, error))?;
-        if !output.status.success() || !thumbnail_path.exists() {
+        if !output.status.success() || !thumbnail_is_valid(&temporary_path) {
+            let _ = fs::remove_file(&temporary_path);
             return Err(format!(
                 "FFmpeg could not create a preview. {}",
                 stderr_text(&output.stderr)
             ));
+        }
+        fs::rename(&temporary_path, &thumbnail_path)
+            .map_err(|error| format!("Could not save generated preview: {error}"))?;
+
+        if let Ok(entries) = fs::read_dir(&thumbnail_dir) {
+            let obsolete_prefix = format!("v1-{}-", recording.id);
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                let is_obsolete = path != thumbnail_path
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(&obsolete_prefix));
+                if is_obsolete {
+                    let _ = fs::remove_file(path);
+                }
+            }
         }
     }
 
@@ -593,6 +630,20 @@ fn create_recording_thumbnail(
         "data:image/jpeg;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
+}
+
+fn thumbnail_is_valid(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() < 512 {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0_u8; 3];
+    file.read_exact(&mut header).is_ok() && header == [0xff, 0xd8, 0xff]
 }
 
 fn parse_srt(contents: &str) -> Result<Vec<TranscriptSegment>, String> {
@@ -801,7 +852,7 @@ fn probe_audio_tracks(
     path: &str,
 ) -> Result<Vec<AudioTrackInfo>, String> {
     let ffprobe = resolve_tool(app, &settings.ffprobe_path, "ffprobe");
-    let output = Command::new(&ffprobe)
+    let output = hidden_command(&ffprobe)
         .args([
             "-v",
             "error",
@@ -926,7 +977,7 @@ fn track_label(track: &AudioTrackInfo, reason: &str) -> String {
 
 fn probe_duration(app: &AppHandle, settings: &AppSettings, path: &str) -> Option<u64> {
     let ffprobe = resolve_tool(app, &settings.ffprobe_path, "ffprobe");
-    let output = Command::new(ffprobe)
+    let output = hidden_command(&ffprobe)
         .args([
             "-v",
             "error",
@@ -967,6 +1018,13 @@ fn resolve_tool(app: &AppHandle, configured: &str, name: &str) -> PathBuf {
         }
     }
     PathBuf::from(executable)
+}
+
+fn hidden_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x0800_0000);
+    command
 }
 
 fn resolve_model(app: &AppHandle, configured: &str) -> Result<PathBuf, String> {

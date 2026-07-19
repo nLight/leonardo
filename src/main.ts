@@ -389,7 +389,7 @@ function observePreviews(): void {
       if (recording) queuePreview(recording);
       previewObserver?.unobserve(element);
     });
-  }, { rootMargin: "180px" });
+  }, { rootMargin: "80px" });
   document.querySelectorAll<HTMLElement>("[data-preview-key]").forEach((element) => {
     const key = element.dataset.previewKey!;
     const cached = previewCache.get(key);
@@ -407,9 +407,13 @@ function queuePreview(recording: Recording): void {
 }
 
 function pumpPreviewQueue(): void {
-  while (previewLoading < 3 && previewQueue.length) {
+  while (previewLoading < 1 && previewQueue.length) {
     const recording = previewQueue.shift()!;
     const key = previewKey(recording);
+    if (!previewIsNearViewport(key)) {
+      previewRequested.delete(key);
+      continue;
+    }
     previewLoading += 1;
     backend<string>("recording_thumbnail", { id: recording.id })
       .then((url) => {
@@ -424,6 +428,13 @@ function pumpPreviewQueue(): void {
         pumpPreviewQueue();
       });
   }
+}
+
+function previewIsNearViewport(key: string): boolean {
+  return [...document.querySelectorAll<HTMLElement>(`[data-preview-key="${CSS.escape(key)}"]`)].some((element) => {
+    const bounds = element.getBoundingClientRect();
+    return bounds.bottom >= -120 && bounds.top <= window.innerHeight + 120;
+  });
 }
 
 function applyPreview(key: string, url: string): void {
