@@ -44,8 +44,6 @@ const FILLERS: &[&str] = &[
 pub struct Cut {
     /// Stable within a plan, and the handle a planner uses instead of a timestamp.
     pub id: String,
-    /// 0 is the narration spine. Higher lanes sit above it, which is where B-roll will go.
-    pub lane: u8,
     pub start_ms: u64,
     pub end_ms: u64,
     /// "narration" for a kept stretch of the take.
@@ -155,7 +153,6 @@ pub fn build_narration_plan(
         .enumerate()
         .map(|(index, range)| Cut {
             id: format!("s{index:04}"),
-            lane: 0,
             start_ms: range.start_ms,
             end_ms: range.end_ms,
             kind: "narration".into(),
@@ -378,7 +375,6 @@ mod tests {
     fn numbers_cuts_in_order_and_labels_them_from_the_script() {
         let plan = build_narration_plan("r", &take(), 30_000, &[]);
         assert_eq!(plan.cuts[0].id, "s0000");
-        assert_eq!(plan.cuts[0].lane, 0);
         assert!(plan.cuts[0].label.starts_with("So the thing about"));
         assert!(plan
             .cuts
