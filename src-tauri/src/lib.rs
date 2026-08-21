@@ -1,5 +1,8 @@
+mod signals;
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use signals::SignalTrack;
 #[cfg(target_os = "windows")]
 use std::os::windows::{fs::MetadataExt, process::CommandExt};
 use std::{
@@ -281,6 +284,35 @@ async fn recording_thumbnail(
     })
     .await
     .map_err(|error| format!("Thumbnail worker stopped: {error}"))?
+}
+
+/// Run — or reuse — the deterministic signal pass for one recording.
+///
+/// The pass is I/O bound and reads the whole file, so its result is cached beside the library
+/// and only recomputed when the caller explicitly asks for a refresh.
+#[tauri::command]
+async fn recording_signals(
+    app: AppHandle,
+    state: State<'_, LibraryState>,
+    id: String,
+    refresh: Option<bool>,
+) -> Result<SignalTrack, String> {
+    let (recording, settings) = {
+        let library = state.0.lock().map_err(lock_error)?;
+        let recording = library
+            .recordings
+            .iter()
+            .find(|item| item.id == id)
+            .cloned()
+            .ok_or_else(|| "Recording not found".to_string())?;
+        (recording, library.settings.clone())
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        analyze_recording_signals(&app, &settings, &recording, refresh.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("Signal worker stopped: {error}"))?
 }
 
 #[tauri::command]
@@ -710,6 +742,154 @@ fn thumbnail_is_valid(path: &Path) -> bool {
     file.read_exact(&mut header).is_ok() && header == [0xff, 0xd8, 0xff]
 }
 
+fn analyze_recording_signals(
+    app: &AppHandle,
+    settings: &AppSettings,
+    recording: &Recording,
+    refresh: bool,
+) -> Result<SignalTrack, String> {
+    let cache_path = signal_track_path(app, recording)?;
+    if !refresh {
+        if let Some(track) = read_cached_signal_track(&cache_path) {
+            return Ok(track);
+        }
+    }
+
+    let ffmpeg = resolve_tool(app, &settings.ffmpeg_path, "ffmpeg");
+    let work_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("Could not locate cache: {error}"))?
+        .join("signals")
+        .join(&recording.id);
+    fs::create_dir_all(&work_dir)
+        .map_err(|error| format!("Could not create analysis workspace: {error}"))?;
+    let scene_path = work_dir.join(signals::SCENE_FILE);
+    let loudness_path = work_dir.join(signals::LOUDNESS_FILE);
+    let _ = fs::remove_file(&scene_path);
+    let _ = fs::remove_file(&loudness_path);
+
+    // Both passes run with the workspace as their working directory so the filter graphs can
+    // name their output files without a Windows path, where the drive colon and the backslashes
+    // would collide with filter argument syntax.
+    let mut video_command = hidden_command(&ffmpeg);
+    video_command
+        .current_dir(&work_dir)
+        .args([
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "info",
+            "-skip_frame",
+            "nokey",
+            "-i",
+        ])
+        .arg(&recording.path)
+        .args(["-an", "-sn", "-map", "0:v:0", "-vf"])
+        .arg(signals::video_filter_graph())
+        .args(["-f", "null", "-"]);
+    let video_output = video_command
+        .output()
+        .map_err(|error| tool_start_error("FFmpeg", &ffmpeg, error))?;
+    if !video_output.status.success() {
+        return Err(format!(
+            "FFmpeg could not analyse the picture. {}",
+            stderr_text(&video_output.stderr)
+        ));
+    }
+
+    let audio_tracks = probe_audio_tracks(app, settings, &recording.path)?;
+    let mut audio_command = hidden_command(&ffmpeg);
+    audio_command
+        .current_dir(&work_dir)
+        .args(["-hide_banner", "-nostats", "-loglevel", "info", "-i"])
+        .arg(&recording.path);
+    let audio_source = configure_audio_analysis(
+        &mut audio_command,
+        &audio_tracks,
+        settings,
+        &signals::audio_filter_chain(),
+    )?;
+    audio_command.args(["-vn", "-sn", "-f", "null", "-"]);
+    let audio_output = audio_command
+        .output()
+        .map_err(|error| tool_start_error("FFmpeg", &ffmpeg, error))?;
+    if !audio_output.status.success() {
+        return Err(format!(
+            "FFmpeg could not analyse the audio. {}",
+            stderr_text(&audio_output.stderr)
+        ));
+    }
+
+    let track = signals::build_signal_track(
+        &fs::read_to_string(&scene_path).unwrap_or_default(),
+        &String::from_utf8_lossy(&video_output.stderr),
+        &fs::read_to_string(&loudness_path).unwrap_or_default(),
+        &String::from_utf8_lossy(&audio_output.stderr),
+        recording
+            .duration_ms
+            .or_else(|| probe_duration(app, settings, &recording.path)),
+        audio_source,
+    );
+    if track.scene_scores.is_empty() && track.loudness.is_empty() {
+        return Err(
+            "The analysis pass produced no signals. Check that the recording still decodes.".into(),
+        );
+    }
+
+    let json = serde_json::to_string(&track)
+        .map_err(|error| format!("Could not serialize the signal track: {error}"))?;
+    fs::write(&cache_path, json)
+        .map_err(|error| format!("Could not save the signal track: {error}"))?;
+    prune_signal_cache(&cache_path, &recording.id);
+    let _ = fs::remove_dir_all(&work_dir);
+    Ok(track)
+}
+
+fn signal_track_path(app: &AppHandle, recording: &Recording) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not locate persistent signal storage: {error}"))?
+        .join("signals");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create persistent signal storage: {error}"))?;
+    Ok(directory.join(format!(
+        "v{}-{}-{}.json",
+        signals::SIGNAL_TRACK_VERSION,
+        recording.id,
+        recording.modified_at
+    )))
+}
+
+fn read_cached_signal_track(path: &Path) -> Option<SignalTrack> {
+    let track: SignalTrack = fs::read_to_string(path)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())?;
+    (track.version == signals::SIGNAL_TRACK_VERSION).then_some(track)
+}
+
+/// Drop tracks left over from an earlier version of the schema or an earlier edit of the file.
+fn prune_signal_cache(current: &Path, recording_id: &str) {
+    let Some(directory) = current.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let is_obsolete = path != current
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(recording_id));
+        if is_obsolete {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 fn parse_srt(contents: &str) -> Result<Vec<TranscriptSegment>, String> {
     let normalized = contents.replace("\r\n", "\n");
     let mut segments = Vec::new();
@@ -966,30 +1146,27 @@ fn probe_audio_tracks(
     }
 }
 
-fn configure_audio_mapping(
-    command: &mut Command,
+/// Which audio a pass should listen to, once the configured policy has been applied.
+enum AudioSelection {
+    /// Every track combined, carrying how many there are.
+    Mix(usize),
+    /// A single zero-based track index.
+    Track(usize),
+}
+
+fn select_audio_source(
     tracks: &[AudioTrackInfo],
     settings: &AppSettings,
-) -> Result<String, String> {
+) -> Result<(AudioSelection, String), String> {
     match settings.audio_mode.as_str() {
-        "mix" if tracks.len() > 1 => {
-            let inputs = (0..tracks.len())
-                .map(|index| format!("[0:a:{index}]"))
-                .collect::<String>();
-            let filter = format!(
-                "{inputs}amix=inputs={}:duration=longest:dropout_transition=0:normalize=1[aout]",
-                tracks.len()
-            );
-            command
-                .arg("-filter_complex")
-                .arg(filter)
-                .args(["-map", "[aout]"]);
-            Ok(format!("Mixed {} audio tracks", tracks.len()))
-        }
-        "mix" => {
-            command.args(["-map", "0:a:0"]);
-            Ok(track_label(&tracks[0], "only audio track"))
-        }
+        "mix" if tracks.len() > 1 => Ok((
+            AudioSelection::Mix(tracks.len()),
+            format!("Mixed {} audio tracks", tracks.len()),
+        )),
+        "mix" => Ok((
+            AudioSelection::Track(0),
+            track_label(&tracks[0], "only audio track"),
+        )),
         "track" => {
             let number = settings.microphone_track.max(1);
             let track = tracks.get(number - 1).ok_or_else(|| {
@@ -1002,16 +1179,75 @@ fn configure_audio_mapping(
                     "Microphone track {number} does not exist in this recording. Available audio tracks: {available}"
                 )
             })?;
-            command.arg("-map").arg(format!("0:a:{}", number - 1));
-            Ok(track_label(track, "configured microphone track"))
+            Ok((
+                AudioSelection::Track(number - 1),
+                track_label(track, "configured microphone track"),
+            ))
         }
         "auto" => {
             let (index, reason) = select_automatic_microphone_track(tracks);
-            command.arg("-map").arg(format!("0:a:{index}"));
-            Ok(track_label(&tracks[index], reason))
+            Ok((
+                AudioSelection::Track(index),
+                track_label(&tracks[index], reason),
+            ))
         }
         value => Err(format!("Unknown audio selection mode: {value}")),
     }
+}
+
+fn amix_filter(count: usize) -> String {
+    format!("amix=inputs={count}:duration=longest:dropout_transition=0:normalize=1")
+}
+
+fn mix_inputs(count: usize) -> String {
+    (0..count)
+        .map(|index| format!("[0:a:{index}]"))
+        .collect::<String>()
+}
+
+fn configure_audio_mapping(
+    command: &mut Command,
+    tracks: &[AudioTrackInfo],
+    settings: &AppSettings,
+) -> Result<String, String> {
+    let (selection, label) = select_audio_source(tracks, settings)?;
+    match selection {
+        AudioSelection::Mix(count) => {
+            command
+                .arg("-filter_complex")
+                .arg(format!("{}{}[aout]", mix_inputs(count), amix_filter(count)))
+                .args(["-map", "[aout]"]);
+        }
+        AudioSelection::Track(index) => {
+            command.arg("-map").arg(format!("0:a:{index}"));
+        }
+    }
+    Ok(label)
+}
+
+/// Map the same audio a transcription would use, with an analysis chain appended.
+///
+/// Analysis always goes through `-filter_complex` because a simple `-af` chain cannot be
+/// attached to a stream that a complex graph already produces, which is what the mixing policy
+/// builds.
+fn configure_audio_analysis(
+    command: &mut Command,
+    tracks: &[AudioTrackInfo],
+    settings: &AppSettings,
+    chain: &str,
+) -> Result<String, String> {
+    let (selection, label) = select_audio_source(tracks, settings)?;
+    let graph = match selection {
+        AudioSelection::Mix(count) => {
+            format!("{}{},{chain}[aout]", mix_inputs(count), amix_filter(count))
+        }
+        AudioSelection::Track(index) => format!("[0:a:{index}]{chain}[aout]"),
+    };
+    command
+        .arg("-filter_complex")
+        .arg(graph)
+        .args(["-map", "[aout]"]);
+    Ok(label)
 }
 
 fn select_automatic_microphone_track(tracks: &[AudioTrackInfo]) -> (usize, &'static str) {
@@ -1254,6 +1490,7 @@ pub fn run() {
             save_settings,
             transcribe_recording,
             recording_thumbnail,
+            recording_signals,
             open_recording,
             export_srt,
             export_resolve_markers
