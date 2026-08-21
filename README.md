@@ -18,6 +18,9 @@ No Python runtime, virtual environment, cloud upload, or account is used. The pa
 - Preserves original filenames and video files; generated names remain metadata.
 - Exports SRT subtitles.
 - Exports an FCPXML selects timeline containing the source clip and chapter markers for DaVinci Resolve.
+- Scans a recording with FFmpeg alone — scene changes, loudness, silence, black, and frozen loading screens — and proposes scored highlight clips from the result.
+- Plans a rough cut from the transcript, dropping dead air, hesitation, and every attempt at a line except the last, and reports what it removed and why.
+- Exports that rough cut as a multi-clip FCPXML timeline, or renders it as a 540p proxy to watch before trusting it.
 - Includes a polished sample-data preview for evaluating the workflow before importing media.
 
 ## End-user experience
