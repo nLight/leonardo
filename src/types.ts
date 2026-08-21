@@ -79,3 +79,26 @@ export interface Highlights {
   deadAir: TimeRange[];
   unusable: TimeRange[];
 }
+
+export interface Cut {
+  id: string;
+  startMs: number;
+  endMs: number;
+  kind: string;
+  label: string;
+}
+
+export interface Removal {
+  startMs: number;
+  endMs: number;
+  reason: string;
+}
+
+export interface EditPlan {
+  version: number;
+  recordingId: string;
+  sourceDurationMs: number;
+  timelineDurationMs: number;
+  cuts: Cut[];
+  removed: Removal[];
+}

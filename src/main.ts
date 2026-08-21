@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
-import { demoHighlights, demoSnapshot } from "./demo";
-import type { AppSettings, Candidate, Highlights, LibrarySnapshot, Recording, RecordingStatus, TimeRange } from "./types";
+import { demoHighlights, demoPlans, demoSnapshot } from "./demo";
+import type { AppSettings, Candidate, EditPlan, Highlights, LibrarySnapshot, Recording, RecordingStatus, Removal, TimeRange } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -50,7 +50,11 @@ let previewLoading = 0;
 const previewCache = new Map<string, string>();
 const highlightsCache = new Map<string, Highlights>();
 const highlightsFailed = new Map<string, string>();
+const planCache = new Map<string, EditPlan>();
+const planFailed = new Map<string, string>();
 let analyzing = "";
+let planning = "";
+let rendering = "";
 const previewRequested = new Set<string>();
 const previewQueue: Recording[] = [];
 
@@ -236,12 +240,60 @@ function renderDetails(recording: Recording): string {
         ${recording.chapters.map((chapter, index) => `<button class="chapter" data-action="seek" data-id="${recording.id}" data-ms="${chapter.startMs}"><span class="chapter-time">${formatTime(chapter.startMs)}</span><span class="chapter-line"></span><span class="chapter-index">${index + 1}</span><span class="chapter-copy"><strong>${escapeHtml(chapter.title)}</strong><small>${escapeHtml(chapter.description)}</small></span>${icons.chevron}</button>`).join("")}
       </section>
       ${renderHighlights(recording)}
+      ${renderRoughCut(recording)}
       <section class="transcript"><div class="section-header"><span>Transcript</span><em>${recording.language?.toUpperCase() || "AUTO"}</em></div>
         ${recording.transcript.map((segment) => `<button class="transcript-line" data-action="seek" data-id="${recording.id}" data-ms="${segment.startMs}"><time>${formatTime(segment.startMs)}</time><span>${highlightQuery(segment.text)}</span></button>`).join("")}
       </section>
     </div>
     <div class="detail-actions"><button class="button secondary" data-action="export-srt" data-id="${recording.id}">${icons.export} Export SRT</button><button class="button primary compact" data-action="export-resolve" data-id="${recording.id}">Resolve markers ${icons.chevron}</button></div>
   </aside>`;
+}
+
+function renderRoughCut(recording: Recording): string {
+  const plan = planCache.get(recording.id);
+  const running = planning === recording.id;
+  const error = planFailed.get(recording.id);
+  return `<section class="rough-cut">
+    <div class="section-header"><span>Rough cut</span>${plan ? `<em>${plan.cuts.length} cuts</em>` : ""}</div>
+    ${plan ? renderPlanBody(recording, plan) : `
+      <p class="highlights-intro">Drop the dead air, the hesitation, and every attempt at a line except the last one. Built from the transcript, sharpened by a scan when one has been run.</p>
+      ${error ? `<p class="highlights-error">${escapeHtml(error)}</p>` : ""}
+      <button class="button secondary full" data-action="plan-cut" data-id="${recording.id}" ${running || busy ? "disabled" : ""}>${running ? "Planning…" : `${icons.spark} Plan a rough cut`}</button>`}
+  </section>`;
+}
+
+function renderPlanBody(recording: Recording, plan: EditPlan): string {
+  const total = Math.max(plan.sourceDurationMs, 1);
+  const saved = plan.sourceDurationMs - plan.timelineDurationMs;
+  const isRendering = rendering === recording.id;
+  return `<p class="plan-headline"><strong>${formatTime(plan.sourceDurationMs)}</strong> becomes <strong>${formatTime(plan.timelineDurationMs)}</strong><small>${formatSeconds(saved)} removed · ${Math.round((saved / total) * 100)}% shorter</small></p>
+    <div class="signal-strip plan-strip" role="img" aria-label="What the rough cut keeps and drops">
+      ${plan.removed.map((removal) => `<span class="strip-band ${reasonClass(removal.reason)}" style="left:${percent(removal.startMs, total)};width:${width(removal, total)}" title="${escapeHtml(removal.reason)} · ${formatTime(removal.startMs)}"></span>`).join("")}
+    </div>
+    <div class="plan-breakdown">
+      ${breakdown(plan.removed).map(([reason, count, ms]) => `<span class="plan-reason"><i class="${reasonClass(reason)}"></i>${escapeHtml(reason)}<em>${formatSeconds(ms)} · ${count}</em></span>`).join("")}
+    </div>
+    <div class="plan-actions">
+      <button class="button secondary" data-action="export-plan" data-id="${recording.id}">${icons.export} Export timeline</button>
+      <button class="button secondary" data-action="render-preview" data-id="${recording.id}" ${isRendering || busy ? "disabled" : ""}>${isRendering ? "Rendering…" : "Render preview"}</button>
+    </div>
+    <p class="highlights-footnote">The timeline opens in Resolve against the original media. The preview is a 540p proxy of the same cut, for watching before trusting.</p>`;
+}
+
+/// Removal reasons, largest total first — the order someone would want to check them in.
+function breakdown(removed: Removal[]): [string, number, number][] {
+  const totals = new Map<string, [number, number]>();
+  for (const removal of removed) {
+    const [count, ms] = totals.get(removal.reason) || [0, 0];
+    totals.set(removal.reason, [count + 1, ms + removal.endMs - removal.startMs]);
+  }
+  return [...totals.entries()]
+    .map(([reason, [count, ms]]): [string, number, number] => [reason, count, ms])
+    .sort((left, right) => right[2] - left[2]);
+}
+
+function reasonClass(reason: string): string {
+  return `reason-${reason.replace(/\s+/g, "-")}`;
 }
 
 function renderHighlights(recording: Recording): string {
@@ -411,6 +463,9 @@ async function handleAction(element: HTMLElement): Promise<void> {
     const ids = selected.size ? [...selected] : snapshot.recordings.filter((item) => item.status === "new" || item.status === "error").map((item) => item.id);
     await transcribe(ids);
   }
+  if (action === "plan-cut" && element.dataset.id) await planRoughCut(element.dataset.id);
+  if (action === "export-plan" && element.dataset.id) await exportRecording("export_edit_plan", element.dataset.id, "Rough cut timeline exported");
+  if (action === "render-preview" && element.dataset.id) await renderRoughCutPreview(element.dataset.id);
   if (action === "analyze" && element.dataset.id) await analyzeHighlights(element.dataset.id);
   if (action === "rescan-highlights" && element.dataset.id) await analyzeHighlights(element.dataset.id, true);
   if (action === "open" && element.dataset.id) await backend("open_recording", { id: element.dataset.id });
@@ -579,6 +634,46 @@ async function analyzeHighlights(id: string, refresh = false): Promise<void> {
     toast(String(error), true);
   } finally {
     analyzing = "";
+    render();
+  }
+}
+
+async function planRoughCut(id: string): Promise<void> {
+  if (planning || busy) return;
+  if (demoMode) {
+    const sample = demoPlans[id];
+    if (sample) planCache.set(id, sample);
+    else toast("This sample recording has no plan attached.");
+    render();
+    return;
+  }
+  planning = id;
+  planFailed.delete(id);
+  render();
+  try {
+    const plan = await backend<EditPlan>("recording_edit_plan", { id });
+    planCache.set(id, plan);
+  } catch (error) {
+    planFailed.set(id, String(error));
+    toast(String(error), true);
+  } finally {
+    planning = "";
+    render();
+  }
+}
+
+async function renderRoughCutPreview(id: string): Promise<void> {
+  if (rendering || busy) return;
+  if (demoMode) { toast("Add your own folder before rendering."); return; }
+  rendering = id;
+  render();
+  try {
+    const path = await backend<string>("render_edit_preview", { id });
+    toast(`Rough cut rendered: ${path}`);
+  } catch (error) {
+    toast(String(error), true);
+  } finally {
+    rendering = "";
     render();
   }
 }
