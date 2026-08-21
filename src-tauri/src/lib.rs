@@ -1,8 +1,10 @@
 mod candidates;
+mod plan;
 mod signals;
 
 use base64::Engine;
 use candidates::Highlights;
+use plan::EditPlan;
 use serde::{Deserialize, Serialize};
 use signals::SignalTrack;
 #[cfg(target_os = "windows")]
@@ -29,10 +31,10 @@ const MIN_MEDIA_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TranscriptSegment {
-    start_ms: u64,
-    end_ms: u64,
-    text: String,
+pub(crate) struct TranscriptSegment {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) text: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -345,6 +347,39 @@ async fn recording_highlights(
     })
     .await
     .map_err(|error| format!("Signal worker stopped: {error}"))?
+}
+
+/// A first cut of one recording.
+///
+/// Silence found by the signal pass sharpens the result, but is not worth an hour of scanning on
+/// its own, so a cached track is used when one exists and the transcript carries the plan when one
+/// does not.
+#[tauri::command]
+fn recording_edit_plan(
+    app: AppHandle,
+    state: State<'_, LibraryState>,
+    id: String,
+) -> Result<EditPlan, String> {
+    let library = state.0.lock().map_err(lock_error)?;
+    let recording = library
+        .recordings
+        .iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "Recording not found".to_string())?;
+    if recording.transcript.is_empty() {
+        return Err("Transcribe this recording before planning a cut.".into());
+    }
+    let dead_air = signal_track_path(&app, recording)
+        .ok()
+        .and_then(|path| read_cached_signal_track(&path))
+        .map(|track| candidates::build_highlights(&track).dead_air)
+        .unwrap_or_default();
+    Ok(plan::build_narration_plan(
+        &recording.id,
+        &recording.transcript,
+        recording.duration_ms.unwrap_or_default(),
+        &dead_air,
+    ))
 }
 
 #[tauri::command]
@@ -1524,6 +1559,7 @@ pub fn run() {
             recording_thumbnail,
             recording_signals,
             recording_highlights,
+            recording_edit_plan,
             open_recording,
             export_srt,
             export_resolve_markers

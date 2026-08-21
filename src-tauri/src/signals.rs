@@ -73,6 +73,47 @@ pub struct SignalTrack {
     pub audio_source: String,
 }
 
+/// Sort, then fuse anything overlapping or separated by less than `gap_ms`.
+pub fn merge_ranges(mut ranges: Vec<TimeRange>, gap_ms: u64) -> Vec<TimeRange> {
+    ranges.sort_by_key(|range| range.start_ms);
+    let mut merged: Vec<TimeRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start_ms <= last.end_ms + gap_ms => {
+                last.end_ms = last.end_ms.max(range.end_ms);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// Everything in `0..duration_ms` that the given ranges do not cover. The input is merged first,
+/// so callers may hand over an unsorted, overlapping list.
+pub fn invert_ranges(ranges: &[TimeRange], duration_ms: u64) -> Vec<TimeRange> {
+    let mut gaps = Vec::new();
+    let mut cursor = 0;
+    for range in merge_ranges(ranges.to_vec(), 0) {
+        if range.start_ms > cursor {
+            gaps.push(TimeRange {
+                start_ms: cursor,
+                end_ms: range.start_ms.min(duration_ms),
+            });
+        }
+        cursor = cursor.max(range.end_ms);
+        if cursor >= duration_ms {
+            return gaps;
+        }
+    }
+    if cursor < duration_ms {
+        gaps.push(TimeRange {
+            start_ms: cursor,
+            end_ms: duration_ms,
+        });
+    }
+    gaps
+}
+
 /// Video analysis, decoding keyframes only.
 ///
 /// `-skip_frame nokey` makes this roughly an order of magnitude cheaper than a full decode, and

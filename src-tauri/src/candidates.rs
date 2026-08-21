@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::signals::{SceneSample, SignalTrack, TimeRange, SILENT_LUFS};
+use crate::signals::{merge_ranges, SceneSample, SignalTrack, TimeRange, SILENT_LUFS};
 
 pub const HIGHLIGHTS_VERSION: u32 = 1;
 
@@ -276,21 +276,6 @@ fn describe_clip(range: TimeRange, score: f32, track: &SignalTrack, cuts: &[u64]
             (false, false) => "steady activity".into(),
         },
     }
-}
-
-/// Sort, then fuse anything overlapping or separated by less than `gap_ms`.
-fn merge_ranges(mut ranges: Vec<TimeRange>, gap_ms: u64) -> Vec<TimeRange> {
-    ranges.sort_by_key(|range| range.start_ms);
-    let mut merged: Vec<TimeRange> = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        match merged.last_mut() {
-            Some(last) if range.start_ms <= last.end_ms + gap_ms => {
-                last.end_ms = last.end_ms.max(range.end_ms);
-            }
-            _ => merged.push(range),
-        }
-    }
-    merged
 }
 
 #[cfg(test)]
