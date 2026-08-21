@@ -1,6 +1,8 @@
+mod candidates;
 mod signals;
 
 use base64::Engine;
+use candidates::Highlights;
 use serde::{Deserialize, Serialize};
 use signals::SignalTrack;
 #[cfg(target_os = "windows")]
@@ -310,6 +312,36 @@ async fn recording_signals(
 
     tauri::async_runtime::spawn_blocking(move || {
         analyze_recording_signals(&app, &settings, &recording, refresh.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("Signal worker stopped: {error}"))?
+}
+
+/// Candidate clips and dead air for one recording.
+///
+/// Deriving them is pure arithmetic over a cached signal track, so nothing here is stored — only
+/// the pass underneath it is.
+#[tauri::command]
+async fn recording_highlights(
+    app: AppHandle,
+    state: State<'_, LibraryState>,
+    id: String,
+    refresh: Option<bool>,
+) -> Result<Highlights, String> {
+    let (recording, settings) = {
+        let library = state.0.lock().map_err(lock_error)?;
+        let recording = library
+            .recordings
+            .iter()
+            .find(|item| item.id == id)
+            .cloned()
+            .ok_or_else(|| "Recording not found".to_string())?;
+        (recording, library.settings.clone())
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        analyze_recording_signals(&app, &settings, &recording, refresh.unwrap_or(false))
+            .map(|track| candidates::build_highlights(&track))
     })
     .await
     .map_err(|error| format!("Signal worker stopped: {error}"))?
@@ -1491,6 +1523,7 @@ pub fn run() {
             transcribe_recording,
             recording_thumbnail,
             recording_signals,
+            recording_highlights,
             open_recording,
             export_srt,
             export_resolve_markers

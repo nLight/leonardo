@@ -35,6 +35,16 @@ pub struct TimeRange {
     pub end_ms: u64,
 }
 
+impl TimeRange {
+    pub fn duration_ms(&self) -> u64 {
+        self.end_ms.saturating_sub(self.start_ms)
+    }
+
+    pub fn contains(&self, at_ms: u64) -> bool {
+        at_ms >= self.start_ms && at_ms < self.end_ms
+    }
+}
+
 /// How different one decoded frame is from the one before it, on FFmpeg's 0..1 scale.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
