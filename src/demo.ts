@@ -1,4 +1,4 @@
-import type { LibrarySnapshot } from "./types";
+import type { Highlights, LibrarySnapshot } from "./types";
 
 export const demoSnapshot: LibrarySnapshot = {
   settings: {
@@ -96,4 +96,33 @@ export const demoSnapshot: LibrarySnapshot = {
       transcript: [],
     },
   ],
+};
+
+/// Sample scan output, so the preview shows what a finished analysis looks like.
+export const demoHighlights: Record<string, Highlights> = {
+  "demo-elden-ring": {
+    version: 1,
+    durationMs: 5_186_000,
+    audioSource: "Track 3 — Mic/Aux (detected by name)",
+    clips: [
+      { id: "c0000", startMs: 214_000, endMs: 222_500, score: 0.41, peakLufs: -19.4, sceneCuts: 2, reason: "loud moment over fast cuts" },
+      { id: "c0001", startMs: 968_500, endMs: 977_000, score: 0.33, peakLufs: -24.1, sceneCuts: 3, reason: "fast cuts" },
+      { id: "c0002", startMs: 2_461_000, endMs: 2_472_500, score: 0.58, peakLufs: -14.8, sceneCuts: 4, reason: "loud moment over fast cuts" },
+      { id: "c0003", startMs: 3_390_000, endMs: 3_398_000, score: 0.27, peakLufs: -26.6, sceneCuts: 1, reason: "steady activity" },
+      { id: "c0004", startMs: 4_360_000, endMs: 4_371_000, score: 0.62, peakLufs: -13.2, sceneCuts: 5, reason: "loud moment over fast cuts" },
+      { id: "c0005", startMs: 4_874_000, endMs: 4_881_500, score: 0.44, peakLufs: -18.9, sceneCuts: 2, reason: "loud moment over fast cuts" },
+    ],
+    deadAir: [
+      { startMs: 132_000, endMs: 139_400 },
+      { startMs: 1_204_000, endMs: 1_211_800 },
+      { startMs: 2_890_000, endMs: 2_903_500 },
+      { startMs: 3_902_000, endMs: 3_915_000 },
+    ],
+    unusable: [
+      { startMs: 0, endMs: 24_000 },
+      { startMs: 1_640_000, endMs: 1_702_000 },
+      { startMs: 3_010_000, endMs: 3_061_000 },
+      { startMs: 4_980_000, endMs: 5_016_000 },
+    ],
+  },
 };

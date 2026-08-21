@@ -55,3 +55,27 @@ export interface LibrarySnapshot {
   recordings: Recording[];
   settings: AppSettings;
 }
+
+export interface TimeRange {
+  startMs: number;
+  endMs: number;
+}
+
+export interface Candidate {
+  id: string;
+  startMs: number;
+  endMs: number;
+  score: number;
+  peakLufs: number;
+  sceneCuts: number;
+  reason: string;
+}
+
+export interface Highlights {
+  version: number;
+  durationMs: number;
+  audioSource: string;
+  clips: Candidate[];
+  deadAir: TimeRange[];
+  unusable: TimeRange[];
+}

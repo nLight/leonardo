@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
-import { demoSnapshot } from "./demo";
-import type { AppSettings, LibrarySnapshot, Recording, RecordingStatus } from "./types";
+import { demoHighlights, demoSnapshot } from "./demo";
+import type { AppSettings, Candidate, Highlights, LibrarySnapshot, Recording, RecordingStatus, TimeRange } from "./types";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -48,6 +48,9 @@ let sortBy: "newest" | "oldest" | "name" | "duration" = "newest";
 let previewObserver: IntersectionObserver | null = null;
 let previewLoading = 0;
 const previewCache = new Map<string, string>();
+const highlightsCache = new Map<string, Highlights>();
+const highlightsFailed = new Map<string, string>();
+let analyzing = "";
 const previewRequested = new Set<string>();
 const previewQueue: Recording[] = [];
 
@@ -232,12 +235,79 @@ function renderDetails(recording: Recording): string {
       <section class="chapters"><div class="section-header"><span>Key moments</span><em>${recording.chapters.length}</em></div>
         ${recording.chapters.map((chapter, index) => `<button class="chapter" data-action="seek" data-id="${recording.id}" data-ms="${chapter.startMs}"><span class="chapter-time">${formatTime(chapter.startMs)}</span><span class="chapter-line"></span><span class="chapter-index">${index + 1}</span><span class="chapter-copy"><strong>${escapeHtml(chapter.title)}</strong><small>${escapeHtml(chapter.description)}</small></span>${icons.chevron}</button>`).join("")}
       </section>
+      ${renderHighlights(recording)}
       <section class="transcript"><div class="section-header"><span>Transcript</span><em>${recording.language?.toUpperCase() || "AUTO"}</em></div>
         ${recording.transcript.map((segment) => `<button class="transcript-line" data-action="seek" data-id="${recording.id}" data-ms="${segment.startMs}"><time>${formatTime(segment.startMs)}</time><span>${highlightQuery(segment.text)}</span></button>`).join("")}
       </section>
     </div>
     <div class="detail-actions"><button class="button secondary" data-action="export-srt" data-id="${recording.id}">${icons.export} Export SRT</button><button class="button primary compact" data-action="export-resolve" data-id="${recording.id}">Resolve markers ${icons.chevron}</button></div>
   </aside>`;
+}
+
+function renderHighlights(recording: Recording): string {
+  const highlights = highlightsCache.get(recording.id);
+  const running = analyzing === recording.id;
+  const error = highlightsFailed.get(recording.id);
+  return `<section class="highlights">
+    <div class="section-header"><span>Highlights</span>
+      ${highlights ? `<button class="icon-button tiny" data-action="rescan-highlights" data-id="${recording.id}" title="Scan again" ${running || busy ? "disabled" : ""}>${icons.refresh}</button>` : `<em>${running ? "scanning" : "not scanned"}</em>`}
+    </div>
+    ${highlights ? renderHighlightBody(recording, highlights) : `
+      <p class="highlights-intro">${running ? "Reading the picture and the audio for scene changes, loud moments, and dead air." : "Scan the picture and the audio for loud moments, scene changes, and stretches worth cutting. The file is read once and the result is cached."}</p>
+      ${error ? `<p class="highlights-error">${escapeHtml(error)}</p>` : ""}
+      <button class="button secondary full" data-action="analyze" data-id="${recording.id}" ${running || busy ? "disabled" : ""}>${running ? "Scanning…" : `${icons.spark} Find highlights`}</button>`}
+  </section>`;
+}
+
+function renderHighlightBody(recording: Recording, highlights: Highlights): string {
+  if (!highlights.clips.length) {
+    return `<p class="highlights-intro">Nothing stood out in this recording — no loud moments and no busy stretches above the noise floor.</p>`;
+  }
+  const total = Math.max(highlights.durationMs, 1);
+  const band = (range: TimeRange, kind: string, label: string) =>
+    `<span class="strip-band ${kind}" style="left:${percent(range.startMs, total)};width:${width(range, total)}" title="${label} · ${formatTime(range.startMs)}"></span>`;
+  return `<div class="signal-strip" role="img" aria-label="Where the highlights sit in this recording">
+      ${highlights.unusable.map((range) => band(range, "unusable", "Loading screen or black")).join("")}
+      ${highlights.deadAir.map((range) => band(range, "dead", "Dead air")).join("")}
+      ${highlights.clips.map((clip) => `<button class="strip-clip" style="left:${percent(clip.startMs, total)};width:${width(clip, total)}" data-action="seek" data-id="${recording.id}" data-ms="${clip.startMs}" title="${escapeHtml(clip.reason)} · ${formatTime(clip.startMs)}"></button>`).join("")}
+    </div>
+    <div class="strip-legend"><span class="key clip"></span>highlight<span class="key dead"></span>dead air<span class="key unusable"></span>loading or black</div>
+    ${highlights.clips.map((clip) => renderHighlightRow(recording, clip)).join("")}
+    <p class="highlights-footnote">${describeDeadAir(highlights)} Measured on ${escapeHtml(highlights.audioSource || "the selected audio track")}.</p>`;
+}
+
+function renderHighlightRow(recording: Recording, clip: Candidate): string {
+  const cuts = clip.sceneCuts === 1 ? "1 cut" : `${clip.sceneCuts} cuts`;
+  return `<button class="highlight-row" data-action="seek" data-id="${recording.id}" data-ms="${clip.startMs}">
+    <span class="highlight-time">${formatTime(clip.startMs)}</span>
+    <span class="highlight-copy"><strong>${escapeHtml(clip.reason)}</strong><small>${formatSeconds(clip.endMs - clip.startMs)} · peak ${clip.peakLufs} LUFS · ${cuts}</small></span>
+    <span class="highlight-score"><i style="width:${Math.round(Math.min(clip.score, 1) * 100)}%"></i></span>
+    ${icons.chevron}
+  </button>`;
+}
+
+function describeDeadAir(highlights: Highlights): string {
+  if (!highlights.deadAir.length) return "No dead air worth cutting.";
+  const total = highlights.deadAir.reduce((sum, range) => sum + range.endMs - range.startMs, 0);
+  const gaps = highlights.deadAir.length === 1 ? "one gap" : `${highlights.deadAir.length} gaps`;
+  return `${formatSeconds(total)} of dead air across ${gaps}.`;
+}
+
+function percent(ms: number, total: number): string {
+  return `${((ms / total) * 100).toFixed(3)}%`;
+}
+
+function width(range: { startMs: number; endMs: number }, total: number): string {
+  // True scale, because the strip is a map and a band that lies about its length is worse than a
+  // thin one. Legibility is a floor in pixels on the elements themselves, where it belongs: a
+  // ten-second clip in a ninety-minute recording is a fraction of a pixel at any window size.
+  return `${(((range.endMs - range.startMs) / total) * 100).toFixed(3)}%`;
+}
+
+function formatSeconds(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 function highlightQuery(text: string): string {
@@ -341,6 +411,8 @@ async function handleAction(element: HTMLElement): Promise<void> {
     const ids = selected.size ? [...selected] : snapshot.recordings.filter((item) => item.status === "new" || item.status === "error").map((item) => item.id);
     await transcribe(ids);
   }
+  if (action === "analyze" && element.dataset.id) await analyzeHighlights(element.dataset.id);
+  if (action === "rescan-highlights" && element.dataset.id) await analyzeHighlights(element.dataset.id, true);
   if (action === "open" && element.dataset.id) await backend("open_recording", { id: element.dataset.id });
   if (action === "seek" && element.dataset.id) await backend("open_recording", { id: element.dataset.id, seekMs: Number(element.dataset.ms || 0) });
   if (action === "export-srt" && element.dataset.id) await exportRecording("export_srt", element.dataset.id, "Subtitle file exported");
@@ -484,6 +556,31 @@ async function transcribe(ids: string[]): Promise<void> {
   selected.clear();
   busy = false;
   render();
+}
+
+async function analyzeHighlights(id: string, refresh = false): Promise<void> {
+  if (analyzing || busy) return;
+  if (demoMode) {
+    const sample = demoHighlights[id];
+    if (sample) highlightsCache.set(id, sample);
+    else toast("This sample recording has no scan attached.");
+    render();
+    return;
+  }
+  analyzing = id;
+  highlightsFailed.delete(id);
+  render();
+  try {
+    const highlights = await backend<Highlights>("recording_highlights", { id, refresh });
+    highlightsCache.set(id, highlights);
+    toast(highlights.clips.length ? `Found ${highlights.clips.length} highlight${highlights.clips.length === 1 ? "" : "s"}` : "Nothing stood out in this recording");
+  } catch (error) {
+    highlightsFailed.set(id, String(error));
+    toast(String(error), true);
+  } finally {
+    analyzing = "";
+    render();
+  }
 }
 
 async function exportRecording(command: string, id: string, message: string): Promise<void> {
